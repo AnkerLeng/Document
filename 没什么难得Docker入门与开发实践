@@ -66,8 +66,54 @@ ssh服务配置文件放在 /etc/ssh/sshd_config 文件中 PermitRootLogin的配
 
 docker 系统镜像都比较干净 没有安装vim编辑器  vim非必须运行软件  受用sed编辑命令来修改配置
 
-sed -i 's/PermitRootLogin prohibit-password/PermitRootLoginyes/' /etc/ssh/sshd_config
+sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
 more /etc/ssh/sshd_config |grep PermitRootLoginyes
+
+
+6.2.3
+使用Dockerfile构建
+
+根据前面搭建SSH服务的操作将整个过程写成一个Dockerfile文件
+```
+#SSH Server
+
+#VERSION 0.0.1
+
+#基础镜像
+
+FROM ubuntu:16.04
+
+#维护者信息
+
+MAINTAINER You Ming <youming@funcuter.org>
+
+#更新软件和安装OpenSSH
+
+RUN atp-get update && apt-get install -y openssh-server
+
+#建立OpenSSH的运行目录
+
+RUN mkdir /var/run/sshd
+
+#在构建时设置root用户的密码
+
+RUN echo 'root:hellossh' | chpasswd
+
+#打开root账户密码登录
+
+RUN sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+
+#对外暴露22端口供SSH客户端连接
+
+EXPOSE 22
+
+#启动命令,携带-D参数使SSHD能在前台运行
+
+CMD ["/user/sbin/sshd","-D"]
+```
+
+
+
 
 
 
