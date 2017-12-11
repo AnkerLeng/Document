@@ -1,0 +1,25 @@
+#Apache  server
+#VERSION 0.0.1
+
+#基础镜像
+FROM ubuntu:16.0.4
+
+#MAINTAINER You Ming <youming@funcuter.org>
+
+#安装 Apache
+RUN apt-get update && apt-get -y install apache2 && apt-get clean
+
+#开启HTTPS支持
+RUN /usr/sbin/a2ensite default-ssl
+
+RUN /usr/sbin/a2enmod ssl
+
+#对外暴露HTTP使用的80端口和HTTPS的443端口
+
+EXPOSE 80
+
+EXPOSE 443
+
+#启动命令,通过-D参数切换到前台运行
+
+CMD ["/usr/sbin/apache2ctl","-D","FOREGROUND"]

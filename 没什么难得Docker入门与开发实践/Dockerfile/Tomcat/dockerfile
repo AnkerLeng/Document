@@ -1,0 +1,23 @@
+#Tomcat server
+
+#VERSION 0.0.1
+
+#基础镜像
+
+FROM java:8-jre
+
+#维护者信息
+
+#MAINTAINER You Ming <youming@funcuter.org>
+
+#安装Tomcat
+
+RUN apt-get update && apt-get install -y tomcat8
+
+#对外暴露Tomcat默认端口
+
+EXPOSE 8080
+
+#启动命令,通过-g参数修改配置,让Tomcat使用前台运行模式
+
+CMD ["/usr/share/tomcat8/bin/catalina.sh","run"]

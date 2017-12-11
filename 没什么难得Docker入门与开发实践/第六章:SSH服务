@@ -1,4 +1,4 @@
-没什么难得Docker入门与开发实践
+## 没什么难得Docker入门与开发实践
 
 
 
@@ -95,7 +95,7 @@ MAINTAINER You Ming <youming@funcuter.org>
 
 #更新软件和安装OpenSSH
 
-RUN atp-get update && apt-get install -y openssh-server
+RUN apt-get update && apt-get install -y openssh-server
 
 #建立OpenSSH的运行目录
 
@@ -115,7 +115,7 @@ EXPOSE 22
 
 #启动命令,携带-D参数使SSHD能在前台运行
 
-CMD ["/user/sbin/sshd","-D"]
+CMD ["/user/sbin/sshd", "-D"]
 ```
 
 
