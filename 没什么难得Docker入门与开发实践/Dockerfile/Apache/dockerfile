@@ -2,7 +2,7 @@
 #VERSION 0.0.1
 
 #基础镜像
-FROM ubuntu:16.0.4
+FROM ubuntu:16.04
 
 #MAINTAINER You Ming <youming@funcuter.org>
 

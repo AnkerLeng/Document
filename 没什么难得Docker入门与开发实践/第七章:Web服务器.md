@@ -89,6 +89,67 @@ EXPOSE 80 443
 CMD ["nginx","-g","daemon off;"]
 ```
 
+7.3.4
+测试Nginx镜像
+docker run -d --name nginx -P ymdot/nginx
+
+docker port nginx
+
+7.4
+Tomcat
+
+7.4.2
+安装Tomcat
+docker run -it --name tomcat java:8-jre /bin/bash
+
+apt-get update
+
+apt-get install -y tomcat8
+
+7.4.3
+构建Tomcat镜像
+
+```
+#Tomcat server
+
+#VERSION 0.0.1
+
+#基础镜像
+
+FROM java:8-jre
+
+#维护者信息
+
+#MAINTAINER You Ming <youming@funcuter.org>
+
+#安装Tomcat
+
+RUN apt-get update && apt-get install -y tomcat8
+
+#对外暴露Tomcat默认端口
+
+EXPOSE 8080
+
+#启动命令,通过-g参数修改配置,让Tomcat使用前台运行模式
+
+CMD ["/usr/share/tomcat8/bin/catalina.sh","run"]
+```
+docker build -t ymdot.tomcat .
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

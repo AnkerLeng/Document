@@ -1,0 +1,27 @@
+#MongoDB
+
+#VERSION 0.0.1
+
+#基础镜像
+
+FROM ubuntu:16.04
+
+#维护者信息
+
+#MAINTAINER You Ming <youming@funcuter.org>
+
+#安装MongoDB
+
+RUN apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv EA312927 && echo "deb http://repo.mongodb.org/apt/ubuntu xenial/mongodb-org/3.2 multiverse" > /etc/apt/sources.list.d/mongodb-org-3.2.list && apt-get update && apt-get install -y mongodb-org=3.2.9 mongodb-org-server=3.2.9
+
+#以数据卷的形式挂载MongoDB存储数据的目录
+
+VOLUME /data/db
+
+#暴露MongoDB默认端口 其中28017是MongoDB提供的HTTP界面的端口
+
+EXPOSE 27017 28017
+
+#启动MongoDB
+
+CMD ["mongod","--httpinterface"]

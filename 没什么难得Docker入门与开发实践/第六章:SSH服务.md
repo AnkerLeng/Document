@@ -115,7 +115,7 @@ EXPOSE 22
 
 #启动命令,携带-D参数使SSHD能在前台运行
 
-CMD ["/user/sbin/sshd", "-D"]
+CMD ["/usr/sbin/sshd", "-D"]
 ```
 
 
