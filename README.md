@@ -1,2 +1,2 @@
 # reading-notes
-笔记
+编程笔记
