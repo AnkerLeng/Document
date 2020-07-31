@@ -1405,6 +1405,481 @@ func (c *lotteryController) GetGet() string {
 
 
 
+>需要并发读写时，一般的做法是加锁，但这样性能并不高，Go语言在 1.9 版本中提供了一种效率较高的并发安全的 sync.Map，sync.Map 和 map 不同，不是以语言原生形态提供，而是在 sync 包下的特殊结构。
+>
+>sync.Map 有以下特性：
+>
+>- 无须初始化，直接声明即可。
+>- sync.Map 不能使用 map 的方式进行取值和设置等操作，而是使用 sync.Map 的方法进行调用，Store 表示存储，Load 表示获取，Delete 表示删除。
+>- 使用 Range 配合一个回调函数进行遍历操作，通过回调函数返回内部遍历出来的值，Range 参数中回调函数的返回值在需要继续迭代遍历时，返回 true，终止迭代遍历时，返回 false。
+
+
+
+### 使用sync.Map 和chan的方式解决并发安全问题
+
+```go
+/**
+ * 微博抢红包
+ * 两个步骤
+ * 1 抢红包，设置红包总金额，红包个数，返回抢红包的地址
+ * GET /set?uid=1&money=100&num=100
+ * 2 抢红包，先到先得，随机得到红包金额
+ * GET /get?id=1&uid=1
+ * 注意：
+ * 线程安全1，红包列表 packageList map 改用线程安全的 sync.Map
+ * 线程安全2，红包里面的金额切片 packageList map[uint32][]uint 并发读写不安全，虽然不会报错
+ * 改进：使用 channel 来更新
+ */
+package main
+
+import (
+	"github.com/kataras/iris"
+	"github.com/kataras/iris/mvc"
+	"os"
+	"log"
+	"fmt"
+	"math/rand"
+	"time"
+	"sync"
+)
+
+// 文件日志
+var logger *log.Logger
+// 当前有效红包列表，int64是红包唯一ID，[]uint是红包里面随机分到的金额（单位分）
+//var packageList map[uint32][]uint = make(map[uint32][]uint)
+var packageList *sync.Map = new(sync.Map)
+var chTasks chan task = make(chan task)
+
+func main() {
+	app := newApp()
+	app.Run(iris.Addr(":8080"))
+}
+
+// 初始化Application
+func newApp() *iris.Application {
+	app := iris.New()
+	mvc.New(app.Party("/")).Handle(&lotteryController{})
+
+	initLog()
+	go fetchPackageMoney()
+	return app
+}
+
+// 初始化日志
+func initLog() {
+	f, _ := os.Create("/var/log/lottery_demo.log")
+	logger = log.New(f, "", log.Ldate|log.Lmicroseconds)
+}
+
+// 单线程死循环，专注处理各个红包中金额切片的数据更新（移除指定位置的金额）
+func fetchPackageMoney() {
+	for {
+		t := <-chTasks
+		// 分配的随机数
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		id := t.id
+		l, ok := packageList.Load(id)
+		if ok && l != nil {
+			list := l.([]uint)
+			// 从红包金额中随机得到一个
+			i := r.Intn(len(list))
+			money := list[i]
+			//if i == len(list) - 1 {
+			//	packageList[uint32(id)] = list[:i]
+			//} else if i == 0 {
+			//	packageList[uint32(id)] = list[1:]
+			//} else {
+			//	packageList[uint32(id)] = append(list[:i], list[i+1:]...)
+			//}
+			if len(list) > 1 {
+				if i == len(list) - 1 {
+					packageList.Store(uint32(id), list[:i])
+				} else if i == 0 {
+					packageList.Store(uint32(id), list[1:])
+				} else {
+					packageList.Store(uint32(id), append(list[:i], list[i+1:]...))
+				}
+			} else {
+				//delete(packageList, uint32(id))
+				packageList.Delete(uint32(id))
+			}
+			// 回调channel返回
+			t.callback <- money
+		} else {
+			t.callback <- 0
+		}
+	}
+}
+// 任务结构
+type task struct {
+	id uint32
+	callback chan uint
+}
+
+// 抽奖的控制器
+type lotteryController struct {
+	Ctx iris.Context
+}
+
+// 返回全部红包地址
+// GET http://localhost:8080/
+func (c *lotteryController) Get() map[uint32][2]int {
+	rs := make(map[uint32][2]int)
+	//for id, list := range packageList {
+	//	var money int
+	//	for _, v := range list {
+	//		money += int(v)
+	//	}
+	//	rs[id] = [2]int{len(list),money}
+	//}
+	packageList.Range(func(key, value interface{}) bool {
+		id := key.(uint32)
+		list := value.([]uint)
+		var money int
+		for _, v := range list {
+			money += int(v)
+		}
+		rs[id] = [2]int{len(list),money}
+		return true
+	})
+	return rs
+}
+
+// 发红包
+// GET http://localhost:8080/set?uid=1&money=100&num=100
+func (c *lotteryController) GetSet() string {
+	uid, errUid := c.Ctx.URLParamInt("uid")
+	money, errMoney := c.Ctx.URLParamFloat64("money")
+	num, errNum := c.Ctx.URLParamInt("num")
+	if errUid != nil || errMoney != nil || errNum != nil {
+		return fmt.Sprintf("参数格式异常，errUid=%s, errMoney=%s, errNum=%s\n", errUid, errMoney, errNum)
+	}
+	moneyTotal := int(money * 100)
+	if uid < 1 || moneyTotal < num || num < 1 {
+		return fmt.Sprintf("参数数值异常，uid=%d, money=%d, num=%d\n", uid, money, num)
+	}
+	// 金额分配算法
+	leftMoney := moneyTotal
+	leftNum := num
+	// 分配的随机数
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	// 随机分配最大比例
+	rMax := 0.55
+	if num >= 1000 {
+		rMax = 0.01
+	}else if num >= 100 {
+		rMax = 0.1
+	} else if num >= 10 {
+		rMax = 0.3
+	}
+	list := make([]uint, num)
+	// 大循环开始，只要还有没分配的名额，继续分配
+	for leftNum > 0 {
+		if leftNum == 1 {
+			// 最后一个名额，把剩余的全部给它
+			list[num-1] = uint(leftMoney)
+			break
+		}
+		// 剩下的最多只能分配到1分钱时，不用再随机
+		if leftMoney == leftNum {
+			for i:=num-leftNum; i < num ; i++ {
+				list[i] = 1
+			}
+			break
+		}
+		// 每次对剩余金额的1%-55%随机，最小1，最大就是剩余金额55%（需要给剩余的名额留下1分钱的生存空间）
+		rMoney := int(float64(leftMoney-leftNum) * rMax)
+		m := r.Intn(rMoney)
+		if m < 1 {
+			m = 1
+		}
+		list[num-leftNum] = uint(m)
+		leftMoney -= m
+		leftNum--
+	}
+	// 最后再来一个红包的唯一ID
+	id := r.Uint32()
+	//packageList[id] = list
+	packageList.Store(id, list)
+	// 返回抢红包的URL
+	return fmt.Sprintf("/get?id=%d&uid=%d&num=%d\n", id, uid, num)
+}
+
+// 抢红包
+// GET http://localhost:8080/get?id=1&uid=1
+func (c *lotteryController) GetGet() string {
+	uid, errUid := c.Ctx.URLParamInt("uid")
+	id, errId := c.Ctx.URLParamInt("id")
+	if errUid != nil || errId != nil {
+		return fmt.Sprintf("参数格式异常，errUid=%s, errId=%s\n", errUid, errId)
+	}
+	if uid < 1 || id < 1 {
+		return fmt.Sprintf("参数数值异常，uid=%d, id=%d\n", uid, id)
+	}
+	//list, ok := packageList[uint32(id)]
+	l, ok := packageList.Load(uint32(id))
+	if !ok {
+		return fmt.Sprintf("红包不存在,id=%d\n", id)
+	}
+	list := l.([]uint)
+	if len(list) < 1 {
+		return fmt.Sprintf("红包不存在,id=%d\n", id)
+	}
+	// 更新红包列表中的信息（移除这个金额），构造一个任务
+	callback := make(chan uint)
+	t := task{id: uint32(id), callback: callback}
+	// 把任务发送给channel
+	chTasks <- t
+	// 回调的channel等待处理结果
+	money := <- callback
+	if money <= 0 {
+		fmt.Println(uid, "很遗憾，没能抢到红包")
+		return fmt.Sprintf("很遗憾，没能抢到红包\n")
+	} else {
+		fmt.Println(uid, "抢到一个红包，金额为:", money)
+		logger.Printf("weiboReadPacket success uid=%d, id=%d, money=%d\n", uid, id, money)
+		return fmt.Sprintf("恭喜你抢到一个红包，金额为:%d\n", money)
+	}
+}
+
+```
+
+
+
+### 再次压测验证和优化改造
+
+```go
+/**
+ * 微博抢红包
+ * 两个步骤
+ * 1 抢红包，设置红包总金额，红包个数，返回抢红包的地址
+ * GET /set?uid=1&money=100&num=100
+ * 2 抢红包，先到先得，随机得到红包金额
+ * GET /get?id=1&uid=1
+ * 注意：
+ * 线程安全1，红包列表 packageList map 改用线程安全的 sync.Map
+ * 线程安全2，红包里面的金额切片 packageList map[uint32][]uint 并发读写不安全，虽然不会报错
+ * 优化 channel 的吞吐量，启动多个处理协程来执行 channel 的消费
+ */
+package main
+
+import (
+	"github.com/kataras/iris"
+	"github.com/kataras/iris/mvc"
+	"os"
+	"log"
+	"fmt"
+	"math/rand"
+	"time"
+	"sync"
+)
+
+// 文件日志
+var logger *log.Logger
+// 当前有效红包列表，int64是红包唯一ID，[]uint是红包里面随机分到的金额（单位分）
+//var packageList map[uint32][]uint = make(map[uint32][]uint)
+var packageList *sync.Map = new(sync.Map)
+//var chTasks chan task = make(chan task)
+const taskNum = 16
+var chTaskList []chan task = make([]chan task, taskNum)
+
+func main() {
+	app := newApp()
+	app.Run(iris.Addr(":8080"))
+}
+
+// 初始化Application
+func newApp() *iris.Application {
+	app := iris.New()
+	mvc.New(app.Party("/")).Handle(&lotteryController{})
+
+	initLog()
+	for i:=0; i<taskNum; i++ {
+		chTaskList[i] = make(chan task)
+		go fetchPackageMoney(chTaskList[i])
+	}
+	return app
+}
+
+// 初始化日志
+func initLog() {
+	f, _ := os.Create("/var/log/lottery_demo.log")
+	logger = log.New(f, "", log.Ldate|log.Lmicroseconds)
+}
+
+// 单线程死循环，专注处理各个红包中金额切片的数据更新（移除指定位置的金额）
+func fetchPackageMoney(chTasks chan task) {
+	for {
+		t := <-chTasks
+		// 分配的随机数
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		id := t.id
+		l, ok := packageList.Load(id)
+		if ok && l != nil {
+			list := l.([]uint)
+			// 从红包金额中随机得到一个
+			i := r.Intn(len(list))
+			money := list[i]
+			//if i == len(list) - 1 {
+			//	packageList[uint32(id)] = list[:i]
+			//} else if i == 0 {
+			//	packageList[uint32(id)] = list[1:]
+			//} else {
+			//	packageList[uint32(id)] = append(list[:i], list[i+1:]...)
+			//}
+			if len(list) > 1 {
+				if i == len(list) - 1 {
+					packageList.Store(uint32(id), list[:i])
+				} else if i == 0 {
+					packageList.Store(uint32(id), list[1:])
+				} else {
+					packageList.Store(uint32(id), append(list[:i], list[i+1:]...))
+				}
+			} else {
+				//delete(packageList, uint32(id))
+				packageList.Delete(uint32(id))
+			}
+			// 回调channel返回
+			t.callback <- money
+		} else {
+			t.callback <- 0
+		}
+	}
+}
+// 任务结构
+type task struct {
+	id uint32
+	callback chan uint
+}
+
+// 抽奖的控制器
+type lotteryController struct {
+	Ctx iris.Context
+}
+
+// 返回全部红包地址
+// GET http://localhost:8080/
+func (c *lotteryController) Get() map[uint32][2]int {
+	rs := make(map[uint32][2]int)
+	//for id, list := range packageList {
+	//	var money int
+	//	for _, v := range list {
+	//		money += int(v)
+	//	}
+	//	rs[id] = [2]int{len(list),money}
+	//}
+	packageList.Range(func(key, value interface{}) bool {
+		id := key.(uint32)
+		list := value.([]uint)
+		var money int
+		for _, v := range list {
+			money += int(v)
+		}
+		rs[id] = [2]int{len(list),money}
+		return true
+	})
+	return rs
+}
+
+// 发红包
+// GET http://localhost:8080/set?uid=1&money=100&num=100
+func (c *lotteryController) GetSet() string {
+	uid, errUid := c.Ctx.URLParamInt("uid")
+	money, errMoney := c.Ctx.URLParamFloat64("money")
+	num, errNum := c.Ctx.URLParamInt("num")
+	if errUid != nil || errMoney != nil || errNum != nil {
+		return fmt.Sprintf("参数格式异常，errUid=%s, errMoney=%s, errNum=%s\n", errUid, errMoney, errNum)
+	}
+	moneyTotal := int(money * 100)
+	if uid < 1 || moneyTotal < num || num < 1 {
+		return fmt.Sprintf("参数数值异常，uid=%d, money=%d, num=%d\n", uid, money, num)
+	}
+	// 金额分配算法
+	leftMoney := moneyTotal
+	leftNum := num
+	// 分配的随机数
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	// 随机分配最大比例
+	rMax := 0.55
+	if num >= 1000 {
+		rMax = 0.01
+	}else if num >= 100 {
+		rMax = 0.1
+	} else if num >= 10 {
+		rMax = 0.3
+	}
+	list := make([]uint, num)
+	// 大循环开始，只要还有没分配的名额，继续分配
+	for leftNum > 0 {
+		if leftNum == 1 {
+			// 最后一个名额，把剩余的全部给它
+			list[num-1] = uint(leftMoney)
+			break
+		}
+		// 剩下的最多只能分配到1分钱时，不用再随机
+		if leftMoney == leftNum {
+			for i:=num-leftNum; i < num ; i++ {
+				list[i] = 1
+			}
+			break
+		}
+		// 每次对剩余金额的1%-55%随机，最小1，最大就是剩余金额55%（需要给剩余的名额留下1分钱的生存空间）
+		rMoney := int(float64(leftMoney-leftNum) * rMax)
+		m := r.Intn(rMoney)
+		if m < 1 {
+			m = 1
+		}
+		list[num-leftNum] = uint(m)
+		leftMoney -= m
+		leftNum--
+	}
+	// 最后再来一个红包的唯一ID
+	id := r.Uint32()
+	//packageList[id] = list
+	packageList.Store(id, list)
+	// 返回抢红包的URL
+	return fmt.Sprintf("/get?id=%d&uid=%d&num=%d\n", id, uid, num)
+}
+
+// 抢红包
+// GET http://localhost:8080/get?id=1&uid=1
+func (c *lotteryController) GetGet() string {
+	uid, errUid := c.Ctx.URLParamInt("uid")
+	id, errId := c.Ctx.URLParamInt("id")
+	if errUid != nil || errId != nil {
+		return fmt.Sprintf("参数格式异常，errUid=%s, errId=%s\n", errUid, errId)
+	}
+	if uid < 1 || id < 1 {
+		return fmt.Sprintf("参数数值异常，uid=%d, id=%d\n", uid, id)
+	}
+	//list, ok := packageList[uint32(id)]
+	l, ok := packageList.Load(uint32(id))
+	if !ok {
+		return fmt.Sprintf("红包不存在,id=%d\n", id)
+	}
+	list := l.([]uint)
+	if len(list) < 1 {
+		return fmt.Sprintf("红包不存在,id=%d\n", id)
+	}
+	// 更新红包列表中的信息（移除这个金额），构造一个任务
+	callback := make(chan uint)
+	t := task{id: uint32(id), callback: callback}
+	// 把任务发送给channel
+	chTasks := chTaskList[id % taskNum]
+	chTasks <- t
+	// 回调的channel等待处理结果
+	money := <- callback
+	if money <= 0 {
+		fmt.Println(uid, "很遗憾，没能抢到红包")
+		return fmt.Sprintf("很遗憾，没能抢到红包\n")
+	} else {
+		fmt.Println(uid, "抢到一个红包，金额为:", money)
+		logger.Printf("weiboReadPacket success uid=%d, id=%d, money=%d\n", uid, id, money)
+		return fmt.Sprintf("恭喜你抢到一个红包，金额为:%d\n", money)
+	}
+}
+```
+
 
 
 
@@ -1412,6 +1887,391 @@ func (c *lotteryController) GetGet() string {
 ## 抽奖大转盘-wheel
 
 
+
+```go
+/**
+ * 大转盘程序
+ * curl http://localhost:8080/
+ * curl http://localhost:8080/debug
+ * curl http://localhost:8080/prize
+ * 固定几个奖品，不同的中奖概率或者总数量限制
+ * 每一次转动抽奖，后端计算出这次抽奖的中奖情况，并返回对应的奖品信息
+ *
+ * 线程不安全，因为获奖概率低，并发更新库存的冲突很少能出现，不容易发现线程安全性问题
+ * 压力测试：
+ * wrk -t10 -c100 -d5 "http://localhost:8080/prize"
+ */
+package main
+
+import (
+	"github.com/kataras/iris"
+	"github.com/kataras/iris/mvc"
+	"fmt"
+	"strings"
+	"time"
+	"math/rand"
+	)
+
+// 奖品中奖概率
+type Prate struct {
+	Rate int		// 万分之N的中奖概率
+	Total int		// 总数量限制，0 表示无限数量
+	CodeA int		// 中奖概率起始编码（包含）
+	CodeB int		// 中奖概率终止编码（包含）
+	Left int 		// 剩余数
+}
+// 奖品列表
+var prizeList []string = []string{
+	"一等奖，火星单程船票",
+	"二等奖，凉飕飕南极之旅",
+	"三等奖，iPhone一部",
+	"",							// 没有中奖
+}
+// 奖品的中奖概率设置，与上面的 prizeList 对应的设置
+var rateList []Prate = []Prate{
+	Prate{1, 1, 0, 0, 1},
+	Prate{2, 2, 1, 2, 2},
+	Prate{5, 10, 3, 5, 10},
+	Prate{100,0, 0, 9999, 0},
+}
+
+func newApp() *iris.Application {
+	app := iris.New()
+	mvc.New(app.Party("/")).Handle(&lotteryController{})
+	return app
+}
+
+func main() {
+	app := newApp()
+	// http://localhost:8080
+	app.Run(iris.Addr(":8080"))
+}
+
+// 抽奖的控制器
+type lotteryController struct {
+	Ctx iris.Context
+}
+
+// GET http://localhost:8080/
+func (c *lotteryController) Get() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	return fmt.Sprintf("大转盘奖品列表：<br/> %s", strings.Join(prizeList, "<br/>\n"))
+}
+
+// GET http://localhost:8080/prize
+func (c *lotteryController) GetPrize() string {
+	c.Ctx.Header("Content-Type", "text/html")
+
+	// 第一步，抽奖，根据随机数匹配奖品
+	seed := time.Now().UnixNano()
+	r := rand.New(rand.NewSource(seed))
+	// 得到个人的抽奖编码
+	code := r.Intn(10000)
+	//fmt.Println("GetPrize code=", code)
+	var myprize string
+	var prizeRate *Prate
+	// 从奖品列表中匹配，是否中奖
+	for i, prize := range prizeList {
+		rate := &rateList[i]
+		if code >= rate.CodeA && code <= rate.CodeB {
+			// 满足中奖条件
+			myprize = prize
+			prizeRate = rate
+			break
+		}
+	}
+	if myprize == "" {
+		// 没有中奖
+		myprize = "很遗憾，再来一次"
+		return myprize
+	}
+	// 第二步，发奖，是否可以发奖
+	if prizeRate.Total == 0 {
+		// 无限奖品
+		fmt.Println("中奖： ", myprize)
+		return myprize
+	} else if prizeRate.Left > 0 {
+		// 还有剩余奖品
+		prizeRate.Left -= 1
+		fmt.Println("中奖： ", myprize)
+		return myprize
+	} else {
+		// 有限且没有剩余奖品，无法发奖
+		myprize = "很遗憾，再来一次"
+		return myprize
+	}
+}
+
+// GET http://localhost:8080/debug
+func (c *lotteryController) GetDebug() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	return fmt.Sprintf("获奖概率： %v", rateList)
+}
+```
+
+
+
+### sync.Mutex和atomic改造性能对比
+
+```go
+/**
+ * 大转盘程序
+ * curl http://localhost:8080/
+ * curl http://localhost:8080/debug
+ * curl http://localhost:8080/prize
+ * 固定几个奖品，不同的中奖概率或者总数量限制
+ * 每一次转动抽奖，后端计算出这次抽奖的中奖情况，并返回对应的奖品信息
+ *
+ * 增加互斥锁，保证并发库存更新的正常
+ * 压力测试：
+ * wrk -t10 -c100 -d5 "http://localhost:8080/prize"
+ */
+package main
+
+import (
+	"github.com/kataras/iris"
+	"github.com/kataras/iris/mvc"
+	"fmt"
+	"strings"
+	"time"
+	"math/rand"
+	"sync"
+)
+
+// 奖品中奖概率
+type Prate struct {
+	Rate int		// 万分之N的中奖概率
+	Total int		// 总数量限制，0 表示无限数量
+	CodeA int		// 中奖概率起始编码（包含）
+	CodeB int		// 中奖概率终止编码（包含）
+	Left int 		// 剩余数
+}
+// 奖品列表
+var prizeList []string = []string{
+	"一等奖，火星单程船票",
+	"二等奖，凉飕飕南极之旅",
+	"三等奖，iPhone一部",
+	"",							// 没有中奖
+}
+// 奖品的中奖概率设置，与上面的 prizeList 对应的设置
+var rateList []Prate = []Prate{
+	//Prate{1, 1, 0, 0, 1},
+	//Prate{2, 2, 1, 2, 2},
+	Prate{5, 1000, 0, 9999, 1000},
+	//Prate{100,0, 0, 9999, 0},
+}
+
+var mu sync.Mutex
+
+func newApp() *iris.Application {
+	app := iris.New()
+	mvc.New(app.Party("/")).Handle(&lotteryController{})
+	return app
+}
+
+func main() {
+	app := newApp()
+	// http://localhost:8080
+	app.Run(iris.Addr(":8080"))
+}
+
+// 抽奖的控制器
+type lotteryController struct {
+	Ctx iris.Context
+}
+
+// GET http://localhost:8080/
+func (c *lotteryController) Get() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	return fmt.Sprintf("大转盘奖品列表：<br/> %s", strings.Join(prizeList, "<br/>\n"))
+}
+
+// GET http://localhost:8080/prize
+func (c *lotteryController) GetPrize() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 第一步，抽奖，根据随机数匹配奖品
+	seed := time.Now().UnixNano()
+	r := rand.New(rand.NewSource(seed))
+	// 得到个人的抽奖编码
+	code := r.Intn(10000)
+	//fmt.Println("GetPrize code=", code)
+	var myprize string
+	var prizeRate *Prate
+	// 从奖品列表中匹配，是否中奖
+	for i, prize := range prizeList {
+		rate := &rateList[i]
+		if code >= rate.CodeA && code <= rate.CodeB {
+			// 满足中奖条件
+			myprize = prize
+			prizeRate = rate
+			break
+		}
+	}
+	if myprize == "" {
+		// 没有中奖
+		myprize = "很遗憾，再来一次"
+		return myprize
+	}
+	// 第二步，发奖，是否可以发奖
+	if prizeRate.Total == 0 {
+		// 无限奖品
+		fmt.Println("中奖： ", myprize)
+		return myprize
+	} else if prizeRate.Left > 0 {
+		// 还有剩余奖品
+		prizeRate.Left -= 1
+		fmt.Println("中奖： ", myprize)
+		return myprize
+	} else {
+		// 有限且没有剩余奖品，无法发奖
+		myprize = "很遗憾，再来一次"
+		return myprize
+	}
+}
+
+// GET http://localhost:8080/debug
+func (c *lotteryController) GetDebug() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	return fmt.Sprintf("获奖概率： %v", rateList)
+}
+
+```
+
+### safe 2
+
+```go
+/**
+ * 大转盘程序
+ * curl http://localhost:8080/
+ * curl http://localhost:8080/debug
+ * curl http://localhost:8080/prize
+ * 固定几个奖品，不同的中奖概率或者总数量限制
+ * 每一次转动抽奖，后端计算出这次抽奖的中奖情况，并返回对应的奖品信息
+ *
+ * 不用互斥锁，而是用CAS操作来更新，保证并发库存更新的正常
+ * 压力测试：
+ * wrk -t10 -c100 -d5 "http://localhost:8080/prize"
+ */
+package main
+
+import (
+	"github.com/kataras/iris"
+	"github.com/kataras/iris/mvc"
+	"fmt"
+	"strings"
+	"time"
+	"math/rand"
+	"sync/atomic"
+)
+
+
+// 奖品中奖概率
+type Prate struct {
+	Rate int		// 万分之N的中奖概率
+	Total int		// 总数量限制，0 表示无限数量
+	CodeA int		// 中奖概率起始编码（包含）
+	CodeB int		// 中奖概率终止编码（包含）
+	Left *int32 		// 剩余数
+}
+// 奖品列表
+var prizeList []string = []string{
+	"一等奖，火星单程船票",
+	"二等奖，凉飕飕南极之旅",
+	"三等奖，iPhone一部",
+	"",							// 没有中奖
+}
+var giftLeft = int32(1000)
+// 奖品的中奖概率设置，与上面的 prizeList 对应的设置
+var rateList []Prate = []Prate{
+	//Prate{1, 1, 0, 0, 1},
+	//Prate{2, 2, 1, 2, 2},
+	Prate{5, 1000, 0, 9999, &giftLeft},
+	//Prate{100,0, 0, 9999, 0},
+}
+
+func newApp() *iris.Application {
+	app := iris.New()
+	mvc.New(app.Party("/")).Handle(&lotteryController{})
+	return app
+}
+
+func main() {
+	app := newApp()
+	// http://localhost:8080
+	app.Run(iris.Addr(":8080"))
+}
+
+// 抽奖的控制器
+type lotteryController struct {
+	Ctx iris.Context
+}
+
+// GET http://localhost:8080/
+func (c *lotteryController) Get() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	return fmt.Sprintf("大转盘奖品列表：<br/> %s", strings.Join(prizeList, "<br/>\n"))
+}
+
+// GET http://localhost:8080/prize
+func (c *lotteryController) GetPrize() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	// 第一步，抽奖，根据随机数匹配奖品
+	seed := time.Now().UnixNano()
+	r := rand.New(rand.NewSource(seed))
+	// 得到个人的抽奖编码
+	code := r.Intn(10000)
+	//fmt.Println("GetPrize code=", code)
+	var myprize string
+	var prizeRate *Prate
+	// 从奖品列表中匹配，是否中奖
+	for i, prize := range prizeList {
+		rate := &rateList[i]
+		if code >= rate.CodeA && code <= rate.CodeB {
+			// 满足中奖条件
+			myprize = prize
+			prizeRate = rate
+			break
+		}
+	}
+	if myprize == "" {
+		// 没有中奖
+		myprize = "很遗憾，再来一次"
+		return myprize
+	}
+	// 第二步，发奖，是否可以发奖
+	if prizeRate.Total == 0 {
+		// 无限奖品
+		fmt.Println("中奖： ", myprize)
+		return myprize
+	} else if *prizeRate.Left > 0 {
+		// 还有剩余奖品，使用 CAS 操作来做安全更新
+		left := atomic.AddInt32(prizeRate.Left, -1)
+		if left >= 0 {
+			fmt.Println("中奖： ", myprize)
+			return myprize
+		}
+	}
+	// 有限且没有剩余奖品，无法发奖
+	myprize = "很遗憾，再来一次"
+	return myprize
+}
+
+// GET http://localhost:8080/debug
+func (c *lotteryController) GetDebug() string {
+	c.Ctx.Header("Content-Type", "text/html")
+	return fmt.Sprintf("获奖概率： %v", rateList)
+}
+
+```
+
+## 六种抽奖活动总结
+
+- 关键点，奖品类型，数量有限，中奖概率，发奖规则
+- 并发安全性问题，互斥，队列，CAS递减
+- 优化，通过散列减少单个集合的大小
 
 
 
